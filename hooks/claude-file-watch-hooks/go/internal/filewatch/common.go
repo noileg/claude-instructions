@@ -6,11 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 )
 
 // Files with these extensions are tracked with their content, so changes are reported
@@ -160,35 +161,59 @@ func StateDir() string {
 	return filepath.Join(home, ".claude", "tmp", "file_watch")
 }
 
-// Per-session state of files tracked with their content: {session_id}.json.
-func StatePath(sessionID string) string {
-	return filepath.Join(StateDir(), sessionID+".json")
+// State layout. Each file has a state file of its own, named after the hash of its path,
+// so hooks that run at the same time (parallel Reads, several sessions) write different
+// files and never undo each other's writes. No locks are used:
+//
+//	{StateDir}/sessions/{session_id}/{sha256 of path}.json  a file read in that session
+//	{StateDir}/claude_edits/{sha256 of path}.json           Claude Code's last write to a file
+//
+// A state file is only ever replaced whole (WriteEntry).
+const (
+	entryExt = ".json"
+	tmpExt   = ".tmp"
+)
+
+func SessionDir(sessionID string) string {
+	return filepath.Join(StateDir(), "sessions", sessionID)
 }
 
-// Per-session state of files tracked by hash only. It is a separate file so that
-// {session_id}.json keeps the {hash, content} format other tools read and append to.
-func HashOnlyStatePath(sessionID string) string {
-	return filepath.Join(StateDir(), sessionID+".hash_only.json")
+func EditsDir() string {
+	return filepath.Join(StateDir(), "claude_edits")
 }
 
+// EntryPath is the state file of path in dir. The path is hashed because it contains
+// characters such as ':' and '\' and has no length limit.
+func EntryPath(dir, path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return filepath.Join(dir, hex.EncodeToString(sum[:])+entryExt)
+}
+
+// Snapshot is a file as Claude Code last saw it. For a text file, Hash is over Content.
+// For a file outside the text list (HashOnly), there is no Content, Hash is over the raw
+// bytes (Sha256File), and Size and ModTime let file_watch_check skip hashing files whose
+// size and modification time have not changed.
 type Snapshot struct {
-	Hash    string `json:"hash"`
-	Content string `json:"content"`
+	Path     string `json:"path"`
+	Hash     string `json:"hash"`
+	Content  string `json:"content,omitempty"`
+	HashOnly bool   `json:"hash_only,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	ModTime  int64  `json:"mtime_ns,omitempty"`
 }
 
-// Hash is over the raw bytes (Sha256File). Size and ModTime let file_watch_check skip
-// hashing files whose size and modification time have not changed.
-type HashOnlySnapshot struct {
-	Hash    string `json:"hash"`
-	Size    int64  `json:"size"`
-	ModTime int64  `json:"mtime_ns"`
+func TextSnapshot(path, content string) Snapshot {
+	return Snapshot{Path: path, Hash: Sha256Hex(content), Content: content}
 }
 
-func NewHashOnlySnapshot(hash string, info os.FileInfo) HashOnlySnapshot {
-	return HashOnlySnapshot{Hash: hash, Size: info.Size(), ModTime: info.ModTime().UnixNano()}
+func HashOnlySnapshot(path, hash string, info os.FileInfo) Snapshot {
+	return Snapshot{Path: path, Hash: hash, HashOnly: true, Size: info.Size(), ModTime: info.ModTime().UnixNano()}
 }
 
+// EditEntry records Claude Code's last write to a file. Hash is over the UTF-8-cleaned
+// text (ReadTextUTF8Replace), whatever the file type.
 type EditEntry struct {
+	Path      string `json:"path"`
 	Hash      string `json:"hash"`
 	SessionID string `json:"session_id"`
 }
@@ -240,47 +265,64 @@ func WriteStdoutJSON(v interface{}) error {
 	return err
 }
 
-func LoadStateMap(path string) map[string]Snapshot {
-	result := map[string]Snapshot{}
-	b, err := os.ReadFile(path)
+// LoadSession returns the snapshots of the files tracked in a session, sorted by path.
+// A state file that cannot be read right now (for example while a hook is replacing it)
+// is left out; it is still there for the next check.
+func LoadSession(sessionID string) []Snapshot {
+	dir := SessionDir(sessionID)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return result
+		return nil
 	}
-	if err := json.Unmarshal(b, &result); err != nil {
-		return map[string]Snapshot{}
+	var result []Snapshot
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != entryExt {
+			continue
+		}
+		var s Snapshot
+		if readJSON(filepath.Join(dir, e.Name()), &s) != nil || s.Path == "" {
+			continue
+		}
+		result = append(result, s)
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
 	return result
 }
 
-func LoadHashOnlyMap(path string) map[string]HashOnlySnapshot {
-	result := map[string]HashOnlySnapshot{}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return result
+// LoadEdit returns the record of Claude Code's last write to path, if there is one.
+func LoadEdit(path string) (EditEntry, bool) {
+	var e EditEntry
+	if readJSON(EntryPath(EditsDir(), path), &e) != nil || e.Path != path {
+		return EditEntry{}, false
 	}
-	if err := json.Unmarshal(b, &result); err != nil {
-		return map[string]HashOnlySnapshot{}
-	}
-	return result
+	return e, true
 }
 
-func LoadRegistryMap(path string) map[string]EditEntry {
-	result := map[string]EditEntry{}
+func readJSON(path string, v interface{}) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return result
+		return err
 	}
-	if err := json.Unmarshal(b, &result); err != nil {
-		return map[string]EditEntry{}
-	}
-	return result
+	return json.Unmarshal(b, v)
 }
 
-// os.Rename replaces an existing destination on Windows too (it uses MoveFileEx).
-// Even when parallel processes write the same state file, others only ever see
-// it before or after a write, never half-written.
-func WriteJSONAtomic(path string, v interface{}) error {
-	dir := filepath.Dir(path)
+// On Windows a file cannot be renamed over while another process has it open (for
+// example file_watch_check reading it; checked on Windows 11 with Go 1.27), so a failed
+// rename is tried again for a while. Variables so that tests can shorten the wait.
+var (
+	renameAttempts = 20
+	renameWait     = 50 * time.Millisecond
+)
+
+// WriteEntry replaces the state file of path in dir with v: it writes a temporary file
+// in dir and renames it over the state file, so a reader sees either the old or the new
+// state file, never half of one.
+//
+// If the rename still fails after the retries, the old state file stays and the error
+// is returned. No change is lost by that: a snapshot only ever holds a version Claude
+// Code has seen, so the next check diffs from it, at worst repeating a change Claude Code
+// already knows. For an edit record, the note "changed by Claude Code" may be missing.
+func WriteEntry(dir, path string, v interface{}) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -288,9 +330,26 @@ func WriteJSONAtomic(path string, v interface{}) error {
 	if err != nil {
 		return err
 	}
-	tmpPath := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
-	if err := os.WriteFile(tmpPath, b, 0644); err != nil {
+	f, err := os.CreateTemp(dir, "*"+tmpExt)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	tmpPath := f.Name()
+	_, err = f.Write(b)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		target := EntryPath(dir, path)
+		for i := 0; i < renameAttempts; i++ {
+			if i > 0 {
+				time.Sleep(renameWait)
+			}
+			if err = os.Rename(tmpPath, target); err == nil {
+				return nil
+			}
+		}
+	}
+	os.Remove(tmpPath)
+	return err
 }

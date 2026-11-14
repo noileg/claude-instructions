@@ -1,12 +1,11 @@
 // PostToolUse (matcher: Edit|Write). Right after Edit/Write changes a file, records its
-// hash in a global registry. file_watch_check compares against it to tell whether a
-// detected change was made by Claude Code itself (the session is recorded too, since
-// several sessions may run at once).
+// hash in a record shared by all sessions. file_watch_check compares against it to tell
+// whether a detected change was made by Claude Code itself (the session is recorded too,
+// since several sessions may run at once).
 package main
 
 import (
 	"os"
-	"path/filepath"
 
 	fw "filewatch/internal/filewatch"
 )
@@ -47,10 +46,5 @@ func main() {
 		return
 	}
 
-	registryPath := filepath.Join(fw.StateDir(), "claude_edits.json")
-	registry := fw.LoadRegistryMap(registryPath)
-	registry[filePath] = fw.EditEntry{Hash: fw.Sha256Hex(content), SessionID: sessionID}
-
-	// Written atomically: parallel processes writing at the same time must not mix their content.
-	fw.WriteJSONAtomic(registryPath, registry)
+	fw.WriteEntry(fw.EditsDir(), filePath, fw.EditEntry{Path: filePath, Hash: fw.Sha256Hex(content), SessionID: sessionID})
 }

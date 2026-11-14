@@ -1,7 +1,7 @@
-// UserPromptSubmit. On every user message, checks whether the files recorded in the
-// state file have changed and, if so, adds their diffs to the context. If a change
-// was made by Claude Code (Edit/Write), the registry left by file_watch_mark_edit
-// says so, and the notice tells this session's changes from other sessions'.
+// UserPromptSubmit. On every user message, checks whether the files tracked in this
+// session have changed and, if so, adds their diffs to the context. If a change was
+// made by Claude Code (Edit/Write), the record left by file_watch_mark_edit says so,
+// and the notice tells this session's changes from other sessions'.
 // Files tracked by hash only are reported as changed, without content.
 //
 // -lang en|ja selects the language of the notice (English by default).
@@ -13,8 +13,6 @@ package main
 
 import (
 	"os"
-	"path/filepath"
-	"sort"
 	"strings"
 
 	fw "filewatch/internal/filewatch"
@@ -78,29 +76,34 @@ func tr(lang, en, ja string) string {
 	return en
 }
 
-func editSourceNote(lang, filePath, currentHash, sessionID string, registry map[string]fw.EditEntry) string {
-	entry, ok := registry[filePath]
+func editSourceNote(lang, filePath, currentHash, sessionID string) string {
+	entry, ok := fw.LoadEdit(filePath)
 	if !ok || entry.Hash != currentHash {
 		return ""
 	}
+	return sourceNoteFor(lang, entry, sessionID)
+}
+
+func sourceNoteFor(lang string, entry fw.EditEntry, sessionID string) string {
 	if entry.SessionID == sessionID {
 		return tr(lang, " (changed by Claude Code in this session)", "（Claude Code・このセッション自身による変更）")
 	}
 	return tr(lang, " (changed by Claude Code in another session)", "（Claude Code・別セッションによる変更）")
 }
 
-// The registry holds the hash of the UTF-8-cleaned text (as file_watch_mark_edit
+// The edit record holds the hash of the UTF-8-cleaned text (as file_watch_mark_edit
 // records it), not the raw-byte hash kept for hash-only files, so it is computed
-// here, and only when the registry has the file at all.
-func hashOnlyEditSourceNote(lang, filePath, sessionID string, registry map[string]fw.EditEntry) string {
-	if _, ok := registry[filePath]; !ok {
+// here, and only when there is a record for the file at all.
+func hashOnlyEditSourceNote(lang, filePath, sessionID string) string {
+	entry, ok := fw.LoadEdit(filePath)
+	if !ok {
 		return ""
 	}
 	text, err := fw.ReadTextUTF8Replace(filePath)
-	if err != nil {
+	if err != nil || entry.Hash != fw.Sha256Hex(text) {
 		return ""
 	}
-	return editSourceNote(lang, filePath, fw.Sha256Hex(text), sessionID, registry)
+	return sourceNoteFor(lang, entry, sessionID)
 }
 
 func main() {
@@ -112,13 +115,19 @@ func main() {
 
 	var data hookInput
 	var changedBlocks []string
+	var updates []fw.Snapshot
+	sessionID := ""
 	if err := fw.ReadStdinJSON(&data); err == nil {
-		sessionID := data.SessionID
+		sessionID = data.SessionID
 		if sessionID == "" {
 			sessionID = "default"
 		}
-		changedBlocks = changedFileBlocks(lang, sessionID)
+		changedBlocks, updates = changedFileBlocks(lang, sessionID)
 	}
+	// The snapshots are updated only after the notice is written, so that a check that is
+	// stopped before writing its notice leaves the old snapshots, and the changes are
+	// reported again next time instead of being lost.
+	defer saveSnapshots(sessionID, updates)
 
 	var context string
 	if len(changedBlocks) > 0 {
@@ -148,50 +157,31 @@ func main() {
 	})
 }
 
+// saveSnapshots replaces the snapshots of the files whose changes were reported (and of
+// hash-only files that were only touched). A snapshot that cannot be replaced keeps its
+// old version; the change is then reported again on the next message.
+func saveSnapshots(sessionID string, updates []fw.Snapshot) {
+	dir := fw.SessionDir(sessionID)
+	for _, s := range updates {
+		fw.WriteEntry(dir, s.Path, s)
+	}
+}
+
 // changedFileBlocks compares the session's snapshots with the files as they are now and
-// returns one block per changed file, updating the state files.
-func changedFileBlocks(lang, sessionID string) []string {
-	statePath := fw.StatePath(sessionID)
-	hashOnlyPath := fw.HashOnlyStatePath(sessionID)
-	state := map[string]fw.Snapshot{}
-	if _, err := os.Stat(statePath); err == nil {
-		state = fw.LoadStateMap(statePath)
-	}
-	hashOnly := map[string]fw.HashOnlySnapshot{}
-	if _, err := os.Stat(hashOnlyPath); err == nil {
-		hashOnly = fw.LoadHashOnlyMap(hashOnlyPath)
-	}
-	if len(state) == 0 && len(hashOnly) == 0 {
-		return nil
-	}
-
-	registry := fw.LoadRegistryMap(filepath.Join(fw.StateDir(), "claude_edits.json"))
-
-	// Sort the paths so the output order is stable (map iteration order is random).
-	// A path in both states is checked as text only, so it is not reported twice.
-	filePaths := make([]string, 0, len(state)+len(hashOnly))
-	for p := range state {
-		filePaths = append(filePaths, p)
-	}
-	for p := range hashOnly {
-		if _, ok := state[p]; !ok {
-			filePaths = append(filePaths, p)
-		}
-	}
-	sort.Strings(filePaths)
-
+// returns one block per changed file, with the snapshots to save afterwards.
+func changedFileBlocks(lang, sessionID string) ([]string, []fw.Snapshot) {
 	var changedBlocks []string
-	dirty := false
-	hashOnlyDirty := false
+	var updates []fw.Snapshot
 
-	for _, filePath := range filePaths {
+	// LoadSession sorts by path, so the output order is stable.
+	for _, snap := range fw.LoadSession(sessionID) {
+		filePath := snap.Path
 		info, err := os.Stat(filePath)
 		if err != nil || info.IsDir() {
 			continue
 		}
 
-		if _, ok := state[filePath]; !ok {
-			snap := hashOnly[filePath]
+		if snap.HashOnly {
 			if info.Size() == snap.Size && info.ModTime().UnixNano() == snap.ModTime {
 				continue
 			}
@@ -199,13 +189,14 @@ func changedFileBlocks(lang, sessionID string) []string {
 			if err != nil {
 				continue
 			}
-			hashOnly[filePath] = fw.NewHashOnlySnapshot(currentHash, info)
-			hashOnlyDirty = true
+			// Saved even when nothing is reported: a file that was only touched gets its new
+			// size and modification time, so it is not hashed again on every message.
+			updates = append(updates, fw.HashOnlySnapshot(filePath, currentHash, info))
 			if currentHash == snap.Hash {
 				continue
 			}
 
-			sourceNote := hashOnlyEditSourceNote(lang, filePath, sessionID, registry)
+			sourceNote := hashOnlyEditSourceNote(lang, filePath, sessionID)
 			header := "### " + filePath + sourceNote
 			changedBlocks = append(changedBlocks, header+"\n"+tr(lang,
 				"(Not a format tracked as text, so only the fact that it changed is reported; no diff is shown.)",
@@ -219,7 +210,6 @@ func changedFileBlocks(lang, sessionID string) []string {
 		}
 
 		currentHash := fw.Sha256Hex(current)
-		snap := state[filePath]
 		if currentHash == snap.Hash {
 			continue
 		}
@@ -235,22 +225,12 @@ func changedFileBlocks(lang, sessionID string) []string {
 			diffText = fw.JoinLines(diffLines)
 		}
 
-		sourceNote := editSourceNote(lang, filePath, currentHash, sessionID, registry)
+		sourceNote := editSourceNote(lang, filePath, currentHash, sessionID)
 		header := "### " + filePath + sourceNote
 		changedBlocks = append(changedBlocks, header+"\n```diff\n"+diffText+"\n```")
 
-		state[filePath] = fw.Snapshot{Hash: currentHash, Content: current}
-		dirty = true
+		updates = append(updates, fw.TextSnapshot(filePath, current))
 	}
 
-	if dirty {
-		fw.WriteJSONAtomic(statePath, state)
-	}
-	// Written even when nothing is reported: a file that was only touched gets its new
-	// size and modification time, so it is not hashed again on every message.
-	if hashOnlyDirty {
-		fw.WriteJSONAtomic(hashOnlyPath, hashOnly)
-	}
-
-	return changedBlocks
+	return changedBlocks, updates
 }

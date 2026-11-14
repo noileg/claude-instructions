@@ -70,7 +70,7 @@ go build -trimpath -o bin/hooks_setup.exe ./cmd/hooks_setup
 
 ## 前提
 
-Windows専用。stateの置き場所は`~/.claude/tmp/file_watch`固定。中身ごと追跡するファイルは`{session_id}.json`、ハッシュだけのファイルは`{session_id}.hash_only.json`に分けて置く。
+Windows専用。stateの置き場所は`~/.claude/tmp/file_watch`固定で、追跡するファイル1件につき1つの小さなファイルに分けて置く。セッションごとに読んだファイルは`sessions/{session_id}/`、Claude Codeが書いたファイルは`claude_edits/`。同時に走るフック（並列のRead、複数のセッション）は別々のファイルに書くので、互いの書き込みを消すことがなく、ロックも使わない。以前の版のstate（`{session_id}.json`・`{session_id}.hash_only.json`・`claude_edits.json`）は読まない。更新する前に読んだファイルは、Claude Codeが次に読んだときから追跡し直す。
 差分を出すのは、既定では`.txt`/`.md`/`.py`など主要なテキスト系拡張子のみ（`internal/filewatch/common.go`の`TextExtensions`。「差分を出す拡張子の指定」参照）。それ以外（画像・PDF・`.ipynb`など）は、変わったことだけを伝える。
 
 ビルド済みのexe（`hooks_setup.exe` と、同じフォルダに置く3本の `file_watch_*.exe`）は

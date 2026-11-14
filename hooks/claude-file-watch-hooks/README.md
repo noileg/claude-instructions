@@ -71,7 +71,7 @@ go build -trimpath -o bin/hooks_setup.exe ./cmd/hooks_setup
 
 ## Notes
 
-Windows only. State is kept in `~/.claude/tmp/file_watch`: `{session_id}.json` for files tracked with their content, `{session_id}.hash_only.json` for the others.
+Windows only. State is kept in `~/.claude/tmp/file_watch`, one small file per tracked file: `sessions/{session_id}/` for the files read in each session, and `claude_edits/` for the files Claude Code wrote. Hooks that run at the same time (parallel Reads, several sessions) write different files, so none of them can undo another's write, and no locks are used. The state files of earlier versions (`{session_id}.json`, `{session_id}.hash_only.json`, `claude_edits.json`) are not read: after updating, a file read before the update is tracked again the next time Claude Code reads it.
 By default only common text formats such as `.txt` / `.md` / `.py` are shown as diffs (`TextExtensions` in `internal/filewatch/common.go`; see "Choosing which extensions get a diff"). For any other file (images, PDFs, `.ipynb` and so on), only the fact that it changed is reported.
 
 Prebuilt exes (`hooks_setup.exe` plus the three `file_watch_*.exe` that go next to it)

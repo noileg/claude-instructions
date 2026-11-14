@@ -41,8 +41,15 @@ func main() {
 	if err != nil || info.IsDir() {
 		return
 	}
+	dir := fw.SessionDir(sessionID)
 	if !textExts.Has(filePath) {
-		trackHashOnly(sessionID, filePath, info)
+		// info is taken before hashing: if the file changes while it is hashed, the recorded
+		// modification time is older than the file's, and file_watch_check hashes it again.
+		hash, err := fw.Sha256File(filePath)
+		if err != nil {
+			return
+		}
+		fw.WriteEntry(dir, filePath, fw.HashOnlySnapshot(filePath, hash, info))
 		return
 	}
 
@@ -50,22 +57,5 @@ func main() {
 	if err != nil {
 		return
 	}
-
-	statePath := fw.StatePath(sessionID)
-	state := fw.LoadStateMap(statePath)
-	state[filePath] = fw.Snapshot{Hash: fw.Sha256Hex(content), Content: content}
-	fw.WriteJSONAtomic(statePath, state)
-}
-
-// info is taken before hashing: if the file changes while it is hashed, the recorded
-// modification time is older than the file's, and file_watch_check hashes it again.
-func trackHashOnly(sessionID, filePath string, info os.FileInfo) {
-	hash, err := fw.Sha256File(filePath)
-	if err != nil {
-		return
-	}
-	statePath := fw.HashOnlyStatePath(sessionID)
-	state := fw.LoadHashOnlyMap(statePath)
-	state[filePath] = fw.NewHashOnlySnapshot(hash, info)
-	fw.WriteJSONAtomic(statePath, state)
+	fw.WriteEntry(dir, filePath, fw.TextSnapshot(filePath, content))
 }
